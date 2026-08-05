@@ -144,6 +144,56 @@ def fetch_one(sym, attempts=3):
     return None
 
 
+ACTION_WORDS = {"up": "Upgrade", "down": "Downgrade", "main": "Maintained",
+                "init": "Initiated", "reit": "Reiterated"}
+
+
+def fetch_ratings(sym, limit=6, attempts=2):
+    """Recent individual analyst actions: firm, new grade, date.
+
+    yfinance exposes these as a DataFrame indexed by grade date with
+    Firm / ToGrade / FromGrade / Action columns. Absent or malformed data
+    is not fatal — the name simply shows no analyst detail.
+    """
+    for i in range(attempts):
+        try:
+            df = yf.Ticker(sym).upgrades_downgrades
+            if df is None or len(df) == 0:
+                return []
+            out = []
+            for idx, row in df.sort_index(ascending=False).head(limit).iterrows():
+                try:
+                    date = idx.strftime("%Y-%m-%d")
+                except Exception:
+                    date = str(idx)[:10]
+                firm = str(row.get("Firm") or "").strip()
+                if not firm:
+                    continue
+                act = str(row.get("Action") or "").strip().lower()
+                out.append({
+                    "firm": firm,
+                    "to": str(row.get("ToGrade") or "").strip() or None,
+                    "from": str(row.get("FromGrade") or "").strip() or None,
+                    "action": ACTION_WORDS.get(act, act.title() or None),
+                    "date": date,
+                })
+            return out
+        except Exception:
+            if i == attempts - 1:
+                return []
+            time.sleep(1.0)
+    return []
+
+
+def attach_ratings(rows):
+    """Pull analyst action history for the names we actually display."""
+    with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {ex.submit(fetch_ratings, r["ticker"]): r for r in rows}
+        for f in cf.as_completed(futs):
+            futs[f]["ratings"] = f.result() or []
+    return rows
+
+
 def fetch_all(symbols):
     rows, failed = [], []
     with cf.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -320,6 +370,35 @@ def num(v, pre="", suf="", nd=2):
     return f"{pre}{v:,.{nd}f}{suf}"
 
 
+def nice_date(iso):
+    """'2026-08-04' -> 'Aug 4, 2026'."""
+    if not iso:
+        return "—"
+    try:
+        return datetime.strptime(iso[:10], "%Y-%m-%d").strftime("%b %-d, %Y")
+    except ValueError:
+        return iso
+
+
+def latest_rating(r):
+    rs = r.get("ratings") or []
+    return rs[0] if rs else None
+
+
+def rating_tooltip(r):
+    """Full recent history, shown on hover over the analyst cell."""
+    rs = r.get("ratings") or []
+    if not rs:
+        return ""
+    lines = []
+    for a in rs:
+        move = (f"{a['from']} → {a['to']}" if a.get("from") and a.get("to")
+                and a["from"] != a["to"] else (a.get("to") or ""))
+        lines.append(f"{nice_date(a['date'])} · {a['firm']}: "
+                     f"{a.get('action') or ''} {move}".strip())
+    return esc("\n".join(lines))
+
+
 def changes_block(rows, prev):
     if not prev or not prev.get("rows"):
         return ("<section class='card'><h2>What changed</h2><p class='quiet'>"
@@ -358,6 +437,30 @@ def changes_block(rows, prev):
         if t in p and p[t].get("consensus") and c.get("consensus") \
                 and p[t]["consensus"] != c["consensus"]:
             items.append(f"{t}: analyst consensus {p[t]['consensus']} → {c['consensus']}")
+    # fresh individual analyst actions since the last refresh
+    new_calls = []
+    for t, c in cur.items():
+        a = latest_rating(c)          # current rows carry 'ratings'; state carries 'latest_rating'
+        if not a:
+            continue
+        old = (p.get(t) or {}).get("latest_rating") or {}
+        if (a.get("date"), a.get("firm"), a.get("to")) != \
+           (old.get("date"), old.get("firm"), old.get("to")):
+            phrase = {
+                "Upgrade": ("upgraded", "to"),
+                "Downgrade": ("downgraded", "to"),
+                "Initiated": ("initiated coverage of", "at"),
+                "Reiterated": ("reiterated", "at"),
+                "Maintained": ("maintained", "at"),
+            }.get(a.get("action"), ("rated", ""))
+            verb, prep = phrase
+            grade = f" {prep} {a['to']}".rstrip() if a.get("to") else ""
+            new_calls.append((a.get("date") or "",
+                              f"{a['firm']} {verb} {t}{grade} "
+                              f"({nice_date(a.get('date'))})"))
+    for _, m in sorted(new_calls, reverse=True)[:6]:
+        items.append(m)
+
     price_moves = []
     for t, c in cur.items():
         if t in p and p[t].get("price") and c.get("price"):
@@ -376,6 +479,25 @@ def changes_block(rows, prev):
     return f"<section class='card'><h2>What changed since {esc(when)}</h2>{body}</section>"
 
 
+def analyst_cells(r):
+    """Three cells: covering firm, the rating it issued, and when."""
+    a = latest_rating(r)
+    if not a:
+        return "<td class='firm'>—</td><td>—</td><td class='num'>—</td>"
+    tip = rating_tooltip(r)
+    title = f" title=\"{tip}\"" if tip else ""
+    grade = a.get("to") or "—"
+    act = a.get("action")
+    # "Upgrade"/"Downgrade" is meaningful context the grade alone doesn't carry
+    if act in ("Upgrade", "Downgrade"):
+        grade = f"{esc(grade)} <span class='act'>({act.lower()})</span>"
+    else:
+        grade = esc(grade)
+    return (f"<td class='firm'{title}>{esc(a['firm'])}</td>"
+            f"<td class='grade'>{grade}</td>"
+            f"<td class='num rdate'>{nice_date(a.get('date'))}</td>")
+
+
 def render(rows, prev, screened, failed):
     now = datetime.now(CENTRAL)
     stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p Central")
@@ -385,7 +507,8 @@ def render(rows, prev, screened, failed):
         "generated_at": now.isoformat(),
         "rows": [{"ticker": r["ticker"], "rank": i + 1, "composite": r["composite"],
                   "price": r.get("price"), "target": r.get("target"),
-                  "consensus": r.get("consensus"), "upside_pct": r.get("upside_pct")}
+                  "consensus": r.get("consensus"), "upside_pct": r.get("upside_pct"),
+                  "latest_rating": latest_rating(r)}
                  for i, r in enumerate(shown)],
     }
 
@@ -425,6 +548,7 @@ def render(rows, prev, screened, failed):
             f"<td class='num'>{dcf}</td>"
             f"<td class='num'>{r['quality_score']:.0f}</td>"
             f"<td class='num score'>{r['composite']}</td>"
+            f"{analyst_cells(r)}"
             f"<td class='flags'>{esc('; '.join(r['flags']) or '—')}</td></tr>")
 
     miss = (f" {len(failed)} member(s) skipped for missing data."
@@ -439,7 +563,7 @@ def render(rows, prev, screened, failed):
 * {{ box-sizing: border-box; }}
 body {{ margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   background:#f9f9f7; color:#0b0b0b; }}
-.wrap {{ max-width:1220px; margin:0 auto; padding:28px 20px 48px; }}
+.wrap {{ max-width:1460px; margin:0 auto; padding:28px 20px 48px; }}
 h1 {{ font-size:22px; margin:0 0 4px; }}
 h2 {{ font-size:15px; margin:0 0 10px; }}
 .sub {{ color:#52514e; font-size:13px; margin:0; line-height:1.5; }}
@@ -458,18 +582,22 @@ h2 {{ font-size:15px; margin:0 0 10px; }}
 .tv {{ font-size:24px; font-weight:650; }}
 .tl {{ font-size:12px; color:#52514e; margin-top:2px; }}
 .tblwrap {{ overflow-x:auto; }}
-table {{ width:100%; border-collapse:collapse; font-size:13px; }}
-th {{ text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.04em;
-  color:#898781; font-weight:600; padding:8px; border-bottom:1px solid #c3c2b7;
+table {{ width:100%; border-collapse:collapse; font-size:12.5px; }}
+th {{ text-align:left; font-size:10.5px; text-transform:uppercase; letter-spacing:.03em;
+  color:#898781; font-weight:600; padding:8px 6px; border-bottom:1px solid #c3c2b7;
   white-space:nowrap; }}
-td {{ padding:7px 8px; border-bottom:1px solid #e1e0d9; vertical-align:top; }}
+td {{ padding:7px 6px; border-bottom:1px solid #e1e0d9; vertical-align:top; }}
 td.num {{ font-variant-numeric: tabular-nums; white-space:nowrap; }}
 td.score {{ font-weight:700; }}
 td.co, td.sec {{ color:#52514e; }}
 td.sec {{ white-space:nowrap; }}
-td.flags {{ color:#52514e; font-size:12px; min-width:120px; max-width:170px;
+td.flags {{ color:#52514e; font-size:11.5px; min-width:105px; max-width:150px;
   white-space:normal; overflow-wrap:break-word; }}
-td.co {{ max-width:170px; }}
+td.co {{ max-width:145px; }}
+td.firm {{ max-width:120px; overflow-wrap:break-word; }}
+td.firm[title] {{ cursor:help; }}
+td.grade, td.rdate {{ white-space:nowrap; }}
+.act {{ color:#898781; }}
 .legend {{ color:#52514e; font-size:12px; margin:12px 2px 0; line-height:1.6; }}
 tbody tr:hover {{ background:#f0efec; }}
 a {{ color:#2a78d6; text-decoration:none; }}
@@ -496,8 +624,9 @@ Each risk flag deducts 4 points. {showing}</p>
 {changes_block(rows, prev)}
 <section class="card"><h2>Ranked candidates</h2><div class="tblwrap"><table>
 <thead><tr><th>#</th><th>Ticker</th><th>Company</th><th>Sector</th><th>Price</th>
-<th>Fwd P/E</th><th>FCF Yld</th><th>Consensus</th><th>Avg Target</th><th>Upside</th>
-<th>DCF Disc.</th><th>Quality</th><th>Score</th><th>Flags</th></tr></thead>
+<th>Fwd P/E</th><th>FCF Yld</th><th>Consensus</th><th>Target</th><th>Upside</th>
+<th>DCF</th><th>Qual.</th><th>Score</th>
+<th>Analyst</th><th>Rating</th><th>Rated</th><th>Flags</th></tr></thead>
 <tbody>
 {chr(10).join(trs)}
 </tbody></table></div>
@@ -505,7 +634,11 @@ Each risk flag deducts 4 points. {showing}</p>
 the street is not constructive · <em>Payout &gt;90%</em> — dividend consumes nearly all
 earnings · <em>Leverage</em> — debt/equity above 2.5x · <em>Unprofitable</em> — no trailing
 earnings · <em>Negative equity</em> — book-value metrics unreliable · <em>Thin coverage</em> —
-fewer than five analysts.</p></section>
+fewer than five analysts.<br>
+<strong>Analyst / Rating / Rated</strong> — the most recent individual rating action
+on record: the covering firm, the grade it assigned, and the date it did so. Hover the firm
+name to see that stock's last several actions. This is one firm's call, not the consensus —
+the Consensus column is the aggregate view, and the two often disagree.</p></section>
 <footer>Data: Yahoo Finance via yfinance; index membership from the public
 s-and-p-500-companies dataset.{miss} Prices reflect the latest available close.
 The DCF is a deliberately simple two-stage model that ignores net debt — treat
@@ -539,6 +672,11 @@ def main():
     rows = score(raw)
     print(f"Scored {len(rows)}. Top 5: "
           + ", ".join(f"{r['ticker']} {r['composite']}" for r in rows[:5]), flush=True)
+
+    print(f"Fetching analyst rating history for the top {SHOW_ROWS}…", flush=True)
+    attach_ratings(rows[:SHOW_ROWS])
+    got = sum(1 for r in rows[:SHOW_ROWS] if r.get("ratings"))
+    print(f"  analyst history for {got}/{min(SHOW_ROWS, len(rows))} names", flush=True)
 
     prev = previous_state()
     html = render(rows, prev, len(rows), failed)
