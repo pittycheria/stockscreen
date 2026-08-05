@@ -56,6 +56,10 @@ SECTOR_ABBR = {
 CENTRAL = ZoneInfo("America/Chicago")
 SHOW_ROWS = 40          # rows rendered in the table
 RATINGS_N = 5           # analyst actions listed per stock
+MIN_VALUE_METRICS = 3   # of the 5 value ratios, how many must exist to rank
+FLOOR_DISCOUNT = -0.20  # DCF pillar floor (maps to a score of 0)
+MAX_UPSIDE = 1.50       # above this, treat the analyst target as a data error
+DOWNSIDE_FLOOR = -0.20  # upside scale runs from this to +0.40
 MAX_WORKERS = 8
 OUT = "index.html"
 
@@ -100,20 +104,19 @@ def fetch_one(sym, attempts=3):
             mc = info.get("marketCap")
             fcf = info.get("freeCashflow")
 
-            # yfinance quirks: debtToEquity arrives as a percentage (124.0 = 1.24x);
-            # margins/growth/ROE arrive as decimals; dividendYield varies by version.
+            # Yahoo reports debtToEquity as a percentage (124.0 == 1.24x). A
+            # NEGATIVE value means negative book equity, which makes the ratio
+            # meaningless — record that fact instead of a nonsense number.
             de = info.get("debtToEquity")
-            de = round(de / 100, 2) if de is not None else None
+            neg_book = de is not None and de < 0
+            de = round(de / 100, 2) if (de is not None and de >= 0) else None
 
-            dy = info.get("dividendYield")
-            if dy is not None:
-                dy = float(dy)
-                dy = dy * 100 if dy < 1 else dy       # tolerate both encodings
-
-            rec = (info.get("recommendationKey") or "").replace("_", " ").title()
-            rec = {"Strong Buy": "Strong Buy", "Buy": "Buy", "Hold": "Hold",
-                   "Underperform": "Sell", "Sell": "Sell",
-                   "Strong Sell": "Strong Sell"}.get(rec) or (rec or None)
+            # Yahoo returns "none" for uncovered names; that must not become the
+            # literal string "None" in the consensus column.
+            raw_rec = (info.get("recommendationKey") or "").strip().lower()
+            rec = {"strong_buy": "Strong Buy", "buy": "Buy", "hold": "Hold",
+                   "underperform": "Sell", "sell": "Sell",
+                   "strong_sell": "Strong Sell"}.get(raw_rec)
 
             return {
                 "ticker": sym,
@@ -131,7 +134,8 @@ def fetch_one(sym, attempts=3):
                 "current_ratio": info.get("currentRatio"),
                 "rev_growth_pct": _pct(info.get("revenueGrowth")),
                 "net_margin_pct": _pct(info.get("profitMargins")),
-                "div_yield_pct": dy,
+                "eps": info.get("trailingEps"),
+                "neg_book_hint": neg_book,
                 "payout_pct": _pct(info.get("payoutRatio")),
                 "target": info.get("targetMeanPrice"),
                 "consensus": rec,
@@ -162,7 +166,11 @@ def fetch_ratings(sym, limit=RATINGS_N, attempts=2):
             if df is None or len(df) == 0:
                 return []
             out = []
-            for idx, row in df.sort_index(ascending=False).head(limit).iterrows():
+            # take more than we need, then filter — trimming first would drop
+            # a good row for every blank-firm row inside the window
+            for idx, row in df.sort_index(ascending=False).head(limit * 3).iterrows():
+                if len(out) >= limit:
+                    break
                 try:
                     date = idx.strftime("%Y-%m-%d")
                 except Exception:
@@ -220,11 +228,21 @@ def pct_rank(pool, v, lower_better):
 
 
 def dcf_discount(r):
+    """Implied discount to a two-stage FCF fair value.
+
+    Returns None only when the model genuinely does not apply (banks, REITs) —
+    in that case the pillar is dropped and the others are renormalized. A
+    non-financial that burns cash returns the floor instead, because dropping
+    the pillar would hand it the average of its other scores and let a
+    cash-burner outrank a company with modest but positive free cash flow.
+    """
     if r["sector"] in FIN_SECTORS:
         return None
     fcf, mc = r.get("fcf_ttm_b"), r.get("market_cap_b")
-    if not fcf or not mc or fcf <= 0:
+    if not mc:
         return None
+    if not fcf or fcf <= 0:
+        return FLOOR_DISCOUNT
     de = r.get("debt_equity")
     beta = r.get("beta") if r.get("beta") is not None else 1.0
     disc = min(max(0.043 + 0.045 * beta, 0.075), 0.12)
@@ -239,12 +257,23 @@ def dcf_discount(r):
         pv += f / (1 + disc) ** yr
     pv += f * (1 + gT) / (disc - gT) / (1 + disc) ** 5
     d = pv / mc - 1
-    if de is not None and de > 2:          # model ignores net debt; haircut levered names
+    # The model ignores net debt, so trim the implied discount on heavily
+    # levered names. Only ever a penalty — halving a negative d would *reward*
+    # leverage on a name the model already calls expensive.
+    if de is not None and de > 2 and d > 0:
         d *= 0.5
     return min(d, 1.5)
 
 
 def quality(r):
+    """Graham-style gates. Returns (score, n_checks).
+
+    Only gates whose input exists are evaluated, so missing data neither
+    passes nor fails. Profitability is deliberately NOT a gate here — it is
+    already a flag, and counting one absent field twice was double-charging it.
+    With fewer than two live gates the score is not meaningful and we return
+    None so the caller can decide.
+    """
     fin = r["sector"] in FIN_SECTORS
     checks = []
     roe = r.get("roe_pct")
@@ -259,15 +288,26 @@ def quality(r):
             checks.append(r["current_ratio"] >= 1.0)
     if r.get("net_margin_pct") is not None:
         checks.append(r["net_margin_pct"] >= (15 if fin else 8))
-    checks.append(r.get("pe") is not None)
-    return sum(checks) / len(checks) * 100 if checks else 0.0
+    if len(checks) < 2:
+        return None, len(checks)
+    return sum(checks) / len(checks) * 100, len(checks)
 
 
 def flags(r):
-    """Short labels — the table explains them once in a legend below it."""
+    """Short labels — the table explains them once in a legend below it.
+
+    'Unprofitable' is a factual claim published on a public page, so it needs
+    corroboration: a missing trailing P/E alone can mean a recent spin-off or
+    a partial Yahoo response, not a loss. We require negative earnings or a
+    negative margin, and say 'No earnings data' when we simply don't know.
+    """
     fl = []
-    if r.get("pe") is None:
+    eps, margin, pe = r.get("eps"), r.get("net_margin_pct"), r.get("pe")
+    loss = (eps is not None and eps < 0) or (margin is not None and margin < 0)
+    if loss:
         fl.append("Unprofitable")
+    elif pe is None and eps is None and margin is None:
+        fl.append("No earnings data")
     if (r.get("payout_pct") or 0) > 90:
         fl.append("Payout >90%")
     de = r.get("debt_equity")
@@ -279,19 +319,27 @@ def flags(r):
         fl.append("Thin coverage")
     if r.get("neg_equity"):
         fl.append("Negative equity")
+    if r.get("sparse"):
+        fl.append("Sparse data")
+    if r.get("target_suspect"):
+        fl.append("Target looks stale")
     return fl
 
 
 def score(rows):
     for r in rows:
-        # defensive: tolerate a D/E that arrives in percent form (124.0 = 1.24x)
-        de = r.get("debt_equity")
-        if de is not None and de > 50:
-            r["debt_equity"] = round(de / 100, 2)
-        # negative/near-zero book equity makes P/B and ROE meaningless
-        r["neg_equity"] = (r.get("pb") or 0) > 100
-        if r["neg_equity"]:
+        # Negative book equity makes P/B and ROE meaningless. Yahoo signals it
+        # with a NEGATIVE priceToBook (or negative debtToEquity) — not a huge
+        # positive one. A very large positive P/B is a different, legitimate
+        # case (asset-light) and must not be mislabelled as negative equity.
+        pb = r.get("pb")
+        r["neg_equity"] = bool(r.get("neg_book_hint")) or (pb is not None and pb < 0)
+        if pb is not None and pb <= 0:
             r["pb"] = None
+        # debt_equity is already converted from Yahoo's percent form in
+        # fetch_one. Do NOT re-normalize here: an earlier "defensive" divide
+        # silently turned the most levered names (60x) into the least (0.6x).
+
     pool = {k: [r.get(k) for r in rows]
             for k in ("forward_pe", "pe", "pb", "ev_ebitda", "fcf_yield_pct")}
     for r in rows:
@@ -300,23 +348,34 @@ def score(rows):
             pct_rank(pool["pe"], r.get("pe"), True),
             pct_rank(pool["pb"], r.get("pb"), True),
             pct_rank(pool["ev_ebitda"], r.get("ev_ebitda"), True),
+            # negative FCF yield is the worst case, not missing data
             0.0 if (r.get("fcf_yield_pct") is not None and r["fcf_yield_pct"] <= 0)
             else pct_rank(pool["fcf_yield_pct"], r.get("fcf_yield_pct"), False),
         ]
         av = [x for x in ranks if x is not None]
+        r["n_value_metrics"] = len(av)
         r["value_score"] = round(sum(av) / len(av), 1) if av else None
 
         d = dcf_discount(r)
         r["dcf_discount_pct"] = round(d * 100, 1) if d is not None else None
         r["dcf_score"] = None if d is None else round(
-            min(max((d + 0.20) / 0.70, 0), 1) * 100, 1)
+            min(max((d - FLOOR_DISCOUNT) / 0.70, 0), 1) * 100, 1)
 
+        # Upside runs from -20% (score 0) to +40% (score 100), so a stock
+        # trading ABOVE its consensus target is genuinely penalised rather
+        # than tying with one that merely has no upside.
         up = (r["target"] / r["price"] - 1) if (r.get("target") and r.get("price")) else None
+        r["target_suspect"] = up is not None and up > MAX_UPSIDE
+        if r["target_suspect"]:
+            up = None                      # stale/unadjusted target: don't score it
         r["upside_pct"] = round(up * 100, 1) if up is not None else None
         r["upside_score"] = None if up is None else round(
-            min(max(up / 0.40, 0), 1) * 100, 1)
+            min(max((up - DOWNSIDE_FLOOR) / 0.60, 0), 1) * 100, 1)
 
-        r["quality_score"] = round(quality(r), 1)
+        q, n_checks = quality(r)
+        r["quality_score"] = round(q, 1) if q is not None else None
+        r["n_quality_checks"] = n_checks
+        r["sparse"] = (r["n_value_metrics"] < MIN_VALUE_METRICS) or (n_checks < 2)
         r["flags"] = flags(r)
 
         parts = [(r["value_score"], .35), (r["dcf_score"], .25),
@@ -326,10 +385,17 @@ def score(rows):
         comp = (sum(s * w for s, w in parts) / wsum if wsum else 0) - 4 * len(r["flags"])
         r["composite"] = round(max(comp, 0), 1)
 
-    # a name needs enough signal to be ranked at all
-    rows = [r for r in rows if r["value_score"] is not None and r.get("price")]
-    rows.sort(key=lambda r: -r["composite"])
-    return rows
+    # A name must carry enough evidence to be ranked at all. Without this a
+    # stock with one cheap-looking ratio and nothing else scores near 100 on
+    # the strength of the single fact we happen to know about it.
+    ranked = [r for r in rows
+              if r.get("price")
+              and r["value_score"] is not None
+              and r["n_value_metrics"] >= MIN_VALUE_METRICS
+              and r["quality_score"] is not None]
+    dropped = len(rows) - len(ranked)
+    ranked.sort(key=lambda r: -r["composite"])
+    return ranked, dropped
 
 
 # --------------------------------------------------------------------------
@@ -509,7 +575,7 @@ def analyst_cells(r):
             f"<td class='num rdate'>{''.join(dates)}</td>")
 
 
-def render(rows, prev, screened, failed):
+def render(rows, prev, screened, failed, dropped=0):
     now = datetime.now(CENTRAL)
     stamp = now.strftime("%A, %B %-d, %Y at %-I:%M %p Central")
     shown = rows[:SHOW_ROWS]
@@ -533,7 +599,7 @@ def render(rows, prev, screened, failed):
   <div class="tile"><div class="tv">{esc(shown[0]['ticker'])}</div>
     <div class="tl">Top ranked · score {shown[0]['composite']}</div></div>
   <div class="tile"><div class="tv">{screened}</div>
-    <div class="tl">Index members screened</div></div>
+    <div class="tl">Index members ranked</div></div>
   <div class="tile"><div class="tv">{(sum(ups)/len(ups) if ups else 0):+.1f}%</div>
     <div class="tl">Avg. upside to target ({scope})</div></div>
   <div class="tile"><div class="tv">{sum(1 for r in shown if not r['flags'])}</div>
@@ -546,6 +612,8 @@ def render(rows, prev, screened, failed):
         dcf = "n/a" if d is None else (">100%" if d > 100 else signed(d, nd=0))
         link = (f"<a href='https://stockanalysis.com/stocks/{r['ticker'].lower()}/'"
                 f" target='_blank' rel='noopener'>{esc(r['ticker'])}</a>")
+        qual = ("—" if r.get("quality_score") is None
+                else f"{r['quality_score']:.0f}")
         trs.append(
             f"<tr><td class='num'>{i}</td><td>{link}</td>"
             f"<td class='co'>{esc(r['name'])}</td>"
@@ -557,13 +625,16 @@ def render(rows, prev, screened, failed):
             f"<td class='num'>{num(r.get('target'), '$')}</td>"
             f"<td class='num'>{signed(r.get('upside_pct'))}</td>"
             f"<td class='num'>{dcf}</td>"
-            f"<td class='num'>{r['quality_score']:.0f}</td>"
+            f"<td class='num'>{qual}</td>"
             f"<td class='num score'>{r['composite']}</td>"
             f"{analyst_cells(r)}"
             f"<td class='flags'>{esc('; '.join(r['flags']) or '—')}</td></tr>")
 
-    miss = (f" {len(failed)} member(s) skipped for missing data."
-            if failed else "")
+    miss = (f" {len(failed)} member(s) returned no usable data." if failed else "")
+    if dropped:
+        miss += (f" {dropped} more were excluded from the ranking for carrying "
+                 f"fewer than {MIN_VALUE_METRICS} of the 5 value ratios or too "
+                 f"few quality inputs to judge.")
 
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
@@ -634,7 +705,8 @@ footer {{ color:#52514e; font-size:12px; line-height:1.6; margin-top:22px; }}
 (fwd P/E, P/E, P/B, EV/EBITDA, FCF yield, percentile-ranked across the index) ·
 DCF fair value 25% (two-stage free-cash-flow model, skipped for financials and REITs) ·
 analyst upside 20% · quality gates 20% (ROE, leverage, liquidity, margins, profitability).
-Each risk flag deducts 4 points. {showing}</p>
+Each risk flag deducts 4 points. Analyst upside is scored from −20% (0) to +40% (100), so a
+stock above its consensus target is penalised, not merely un-rewarded. {showing}</p>
 <div class="stamp">Last refreshed: {stamp}</div>
 {tiles}
 {changes_block(rows, prev)}
@@ -648,9 +720,12 @@ Each risk flag deducts 4 points. {showing}</p>
 </tbody></table></div>
 <p class="legend"><strong>Flags</strong> (each deducts 4 points): <em>Hold/Sell consensus</em> —
 the street is not constructive · <em>Payout &gt;90%</em> — dividend consumes nearly all
-earnings · <em>Leverage</em> — debt/equity above 2.5x · <em>Unprofitable</em> — no trailing
-earnings · <em>Negative equity</em> — book-value metrics unreliable · <em>Thin coverage</em> —
-fewer than five analysts.<br>
+earnings · <em>Leverage</em> — debt/equity above 2.5x · <em>Unprofitable</em> — negative
+trailing earnings or margin · <em>No earnings data</em> — profitability could not be
+determined · <em>Negative equity</em> — book-value metrics unreliable · <em>Thin coverage</em>
+— fewer than five analysts · <em>Sparse data</em> — thin inputs, treat the score as low
+confidence · <em>Target looks stale</em> — implied upside above {MAX_UPSIDE:.0%}, usually an
+unrevised or unadjusted target, so the upside pillar was not scored.<br>
 <strong>Analyst / Rating / Rated</strong> — the last {RATINGS_N} individual rating actions on
 record, newest first: the covering firm, the grade it assigned, and the date. These are
 individual firms' calls, not the consensus — the Consensus column is the aggregate view, and
@@ -685,9 +760,12 @@ def main():
     for r in raw:
         r["name"], r["sector"] = cons[r["ticker"]]
 
-    rows = score(raw)
-    print(f"Scored {len(rows)}. Top 5: "
+    rows, dropped = score(raw)
+    print(f"Scored {len(rows)} (dropped {dropped} for insufficient data). Top 5: "
           + ", ".join(f"{r['ticker']} {r['composite']}" for r in rows[:5]), flush=True)
+    if not rows:
+        print("FATAL: nothing ranked.", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Fetching analyst rating history for the top {SHOW_ROWS}…", flush=True)
     attach_ratings(rows[:SHOW_ROWS])
@@ -695,7 +773,7 @@ def main():
     print(f"  analyst history for {got}/{min(SHOW_ROWS, len(rows))} names", flush=True)
 
     prev = previous_state()
-    html = render(rows, prev, len(rows), failed)
+    html = render(rows, prev, len(rows), failed, dropped)
     with open(OUT, "w", encoding="utf-8") as fh:
         fh.write(html)
     print(f"Wrote {OUT} ({len(html):,} bytes)", flush=True)
