@@ -55,6 +55,7 @@ SECTOR_ABBR = {
 }
 CENTRAL = ZoneInfo("America/Chicago")
 SHOW_ROWS = 40          # rows rendered in the table
+RATINGS_N = 5           # analyst actions listed per stock
 MAX_WORKERS = 8
 OUT = "index.html"
 
@@ -148,7 +149,7 @@ ACTION_WORDS = {"up": "Upgrade", "down": "Downgrade", "main": "Maintained",
                 "init": "Initiated", "reit": "Reiterated"}
 
 
-def fetch_ratings(sym, limit=6, attempts=2):
+def fetch_ratings(sym, limit=RATINGS_N, attempts=2):
     """Recent individual analyst actions: firm, new grade, date.
 
     yfinance exposes these as a DataFrame indexed by grade date with
@@ -480,22 +481,32 @@ def changes_block(rows, prev):
 
 
 def analyst_cells(r):
-    """Three cells: covering firm, the rating it issued, and when."""
-    a = latest_rating(r)
-    if not a:
-        return "<td class='firm'>—</td><td>—</td><td class='num'>—</td>"
-    tip = rating_tooltip(r)
-    title = f" title=\"{tip}\"" if tip else ""
-    grade = a.get("to") or "—"
-    act = a.get("action")
-    # "Upgrade"/"Downgrade" is meaningful context the grade alone doesn't carry
-    if act in ("Upgrade", "Downgrade"):
-        grade = f"{esc(grade)} <span class='act'>({act.lower()})</span>"
-    else:
-        grade = esc(grade)
-    return (f"<td class='firm'{title}>{esc(a['firm'])}</td>"
-            f"<td class='grade'>{grade}</td>"
-            f"<td class='num rdate'>{nice_date(a.get('date'))}</td>")
+    """Three aligned cells listing this stock's last few analyst actions.
+
+    Each cell holds one single-line div per action, so the firm, its grade and
+    the date line up row-for-row across the three columns. Long firm names are
+    ellipsized rather than wrapped — wrapping would break that alignment — with
+    the full name on hover.
+    """
+    rs = (r.get("ratings") or [])[:RATINGS_N]
+    if not rs:
+        return ("<td class='firm'>—</td><td class='grade'>—</td>"
+                "<td class='num rdate'>—</td>")
+
+    firms, grades, dates = [], [], []
+    for a in rs:
+        firms.append(f"<div class='ln' title=\"{esc(a['firm'])}\">"
+                     f"{esc(a['firm'])}</div>")
+        g = esc(a.get("to") or "—")
+        act = a.get("action")
+        if act in ("Upgrade", "Downgrade"):
+            g += f" <span class='act'>({act.lower()})</span>"
+        grades.append(f"<div class='ln'>{g}</div>")
+        dates.append(f"<div class='ln'>{nice_date(a.get('date'))}</div>")
+
+    return (f"<td class='firm'>{''.join(firms)}</td>"
+            f"<td class='grade'>{''.join(grades)}</td>"
+            f"<td class='num rdate'>{''.join(dates)}</td>")
 
 
 def render(rows, prev, screened, failed):
@@ -594,9 +605,13 @@ td.sec {{ white-space:nowrap; }}
 td.flags {{ color:#52514e; font-size:11.5px; min-width:105px; max-width:150px;
   white-space:normal; overflow-wrap:break-word; }}
 td.co {{ max-width:145px; }}
-td.firm {{ max-width:120px; overflow-wrap:break-word; }}
-td.firm[title] {{ cursor:help; }}
+td.firm {{ width:130px; max-width:130px; }}
 td.grade, td.rdate {{ white-space:nowrap; }}
+/* one action per line; identical line boxes keep the three columns aligned */
+.ln {{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  line-height:1.65; }}
+.ln + .ln {{ border-top:1px dotted rgba(11,11,11,.07); }}
+td.firm .ln {{ cursor:help; }}
 .act {{ color:#898781; }}
 .legend {{ color:#52514e; font-size:12px; margin:12px 2px 0; line-height:1.6; }}
 tbody tr:hover {{ background:#f0efec; }}
@@ -609,6 +624,7 @@ footer {{ color:#52514e; font-size:12px; line-height:1.6; margin-top:22px; }}
   th {{ color:#898781; border-color:#2c2c2a; }}
   td {{ border-color:#2c2c2a; }}
   .sub, .quiet, .tl, td.co, td.sec, td.flags, footer {{ color:#c3c2b7; }}
+  .ln + .ln {{ border-color:rgba(255,255,255,.08); }}
   tbody tr:hover {{ background:#222220; }}
   a {{ color:#3987e5; }}
 }}
@@ -626,7 +642,7 @@ Each risk flag deducts 4 points. {showing}</p>
 <thead><tr><th>#</th><th>Ticker</th><th>Company</th><th>Sector</th><th>Price</th>
 <th>Fwd P/E</th><th>FCF Yld</th><th>Consensus</th><th>Target</th><th>Upside</th>
 <th>DCF</th><th>Qual.</th><th>Score</th>
-<th>Analyst</th><th>Rating</th><th>Rated</th><th>Flags</th></tr></thead>
+<th>Analyst (last {RATINGS_N})</th><th>Rating</th><th>Rated</th><th>Flags</th></tr></thead>
 <tbody>
 {chr(10).join(trs)}
 </tbody></table></div>
@@ -635,10 +651,10 @@ the street is not constructive · <em>Payout &gt;90%</em> — dividend consumes 
 earnings · <em>Leverage</em> — debt/equity above 2.5x · <em>Unprofitable</em> — no trailing
 earnings · <em>Negative equity</em> — book-value metrics unreliable · <em>Thin coverage</em> —
 fewer than five analysts.<br>
-<strong>Analyst / Rating / Rated</strong> — the most recent individual rating action
-on record: the covering firm, the grade it assigned, and the date it did so. Hover the firm
-name to see that stock's last several actions. This is one firm's call, not the consensus —
-the Consensus column is the aggregate view, and the two often disagree.</p></section>
+<strong>Analyst / Rating / Rated</strong> — the last {RATINGS_N} individual rating actions on
+record, newest first: the covering firm, the grade it assigned, and the date. These are
+individual firms' calls, not the consensus — the Consensus column is the aggregate view, and
+the two often disagree. Coverage depth varies, so some names list fewer than {RATINGS_N}.</p></section>
 <footer>Data: Yahoo Finance via yfinance; index membership from the public
 s-and-p-500-companies dataset.{miss} Prices reflect the latest available close.
 The DCF is a deliberately simple two-stage model that ignores net debt — treat
