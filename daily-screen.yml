@@ -1,13 +1,17 @@
 name: Daily S&P 500 undervalued screen
 
-# GitHub cron is UTC and does not follow daylight saving, so we fire at both
-# 10:00 and 11:00 UTC and let the job itself continue only when it is 5 AM in
-# Chicago. That lands at 5:00 AM Central year round.
+# GitHub cron is UTC, doesn't follow daylight saving, and — crucially — start
+# times routinely drift 15-60+ minutes past the scheduled minute. So instead of
+# gating on "is the clock hour exactly 5 in Chicago" (which a late start
+# silently fails), we gate on "has the page already been refreshed today?".
+# Three slots fire; the first one to actually start does the work, the others
+# see today's refresh already committed and exit in seconds.
 on:
   schedule:
-    - cron: "0 10 * * *"
-    - cron: "0 11 * * *"
-  workflow_dispatch:        # lets you run it on demand from the Actions tab
+    - cron: "0 10 * * *"    # 5:00 AM Chicago during daylight time
+    - cron: "0 11 * * *"    # 5:00 AM during standard time; retry slot in summer
+    - cron: "30 12 * * *"   # late backup in case both earlier starts were delayed
+  workflow_dispatch:        # manual runs always refresh, regardless of the gate
 
 permissions:
   contents: write           # needed to commit the regenerated index.html
@@ -24,19 +28,30 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history so the gate can see when index.html last changed
 
-      - name: Is it 5 AM in Chicago?
+      - name: Should we refresh today?
         id: gate
         env:
           EVENT: ${{ github.event_name }}
         run: |
           python - <<'PY'
-          import os, datetime
+          import os, subprocess, datetime
           from zoneinfo import ZoneInfo
-          now = datetime.datetime.now(ZoneInfo("America/Chicago"))
+          tz = ZoneInfo("America/Chicago")
+          now = datetime.datetime.now(tz)
           manual = os.environ.get("EVENT") == "workflow_dispatch"
-          go = manual or now.hour == 5
-          print(f"Chicago time {now:%Y-%m-%d %H:%M %Z} · manual={manual} · run={go}")
+          out = subprocess.run(
+              ["git", "log", "-1", "--format=%cI", "--", "index.html"],
+              capture_output=True, text=True).stdout.strip()
+          last = (datetime.datetime.fromisoformat(out).astimezone(tz).date()
+                  if out else None)
+          # Run if triggered manually, or if the page hasn't been refreshed
+          # today yet AND we're past 5 AM Chicago (keeps the winter 10:00 UTC
+          # slot, which is 4 AM Central, from refreshing an hour early).
+          go = manual or ((last is None or last < now.date()) and now.hour >= 5)
+          print(f"Chicago {now:%Y-%m-%d %H:%M %Z} · last refresh {last} · manual={manual} -> run={go}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"go={'true' if go else 'false'}\n")
           PY
